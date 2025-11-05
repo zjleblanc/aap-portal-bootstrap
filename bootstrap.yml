@@ -1,0 +1,212 @@
+---
+- name: AAP Portal Bootstrap
+  hosts: localhost
+  gather_facts: false
+  become: false
+
+  vars:
+    # --- Important Environment Variables ---
+    # AAP_HOSTNAME: "https://your-aap-url.example.com"
+    # AAP_USERNAME: "aap_admin_user"
+    # AAP_PASSWORD: "YOUR_AAP_ADMIN_PASSWORD"
+
+    # --- Configuration Variables ---
+    aap_org_name: "Default"
+    aap_app_name: "Automation Self-Service Portal"
+    ocp_project_name: aap-portal
+    ocp_build_config_name: plugin-registry
+
+    # --- Artifacts ---
+    aap_version: 2.6
+    rhel_version: 10
+    release_arch: x86_64
+    aap_release_url: "ansible-automation-platform-{{ aap_version }}-for-rhel-{{ rhel_version }}-{{ release_arch }}-files"
+    plugins_download_dest: "{{ playbook_dir }}/self-service-automation-portal-plugins"
+
+  tasks:
+    - name: Create Organization
+      tags: aap
+      ansible.platform.organization:
+        name: "{{ aap_org_name }}"
+        state: present
+
+    - name: Create OAuth Application
+      tags: aap
+      register: r_oauth_app
+      ansible.platform.application:
+        name: "{{ aap_app_name }}"
+        organization: "{{ aap_org_name }}"
+        authorization_grant_type: authorization-code
+        client_type: confidential
+        redirect_uris: "https://example.com" # Placeholder URI as per documentation
+        state: present
+
+    # - name: Debug OAuth details
+    #   when: r_oauth_app.changed or not r_oauth_app.client_id
+    #   ansible.builtin.debug:
+    #     msg: |
+    #       OAuth Client ID: {{ r_oauth_app.client_id }}
+    #       OAuth Client Secret: {{ r_oauth_app.client_secret }}
+    #       Remember to replace the placeholder Redirect URI
+    #       with the actual deployment URL after installation.
+
+    - name: Allow OAuth2 for External Users
+      tags: aap
+      ansible.platform.settings:
+        settings:
+          ALLOW_OAUTH2_FOR_EXTERNAL_USERS: true
+
+    - name: Create read-only token for Admin
+      tags: aap
+      register: r_readonly_token
+      ansible.platform.token:
+        description: "Self-Service Automation Portal"
+        scope: read # Scope is set to 'Read' as per documentation
+        state: present
+
+    - name: Debug admin token
+      tags: aap
+      when: r_readonly_token.changed
+      ansible.builtin.debug:
+        msg: "Generated Admin Token: {{ r_readonly_token.ansible_facts.aap_token.token }}"
+
+    # Modified tasks from infra.aap_utilities.aap_setup_download
+    - name: Login to Red Hat APIs
+      tags: rhsm
+      register: r_rhsm_token
+      ansible.builtin.uri:
+        url: https://sso.redhat.com/auth/realms/redhat-external/protocol/openid-connect/token
+        method: POST
+        body_format: form-urlencoded
+        body:
+          grant_type: refresh_token
+          client_id: rhsm-api
+          refresh_token: "{{ rhsm_offline_token }}"
+
+    - name: Collecting the available installers
+      tags: rhsm
+      register: r_aap_installers
+      ansible.builtin.uri:
+        url: "https://api.access.redhat.com/management/v1/images/cset/{{ aap_release_url }}"
+        method: GET
+        return_content: true
+        headers:
+          Authorization: Bearer {{ r_rhsm_token.json.access_token }}
+
+    - name: Extract download path for Self-Service Portal plugins
+      tags: rhsm
+      ansible.builtin.set_fact:
+        _aap_portal_plugins: "{{ r_aap_installers.json.body | selectattr('filename','match','self-service') | first }}"
+
+    - name: Downloading the plugins
+      tags: rhsm
+      ansible.builtin.get_url:
+        url: "{{ _aap_portal_plugins.downloadHref }}"
+        dest: "{{ playbook_dir }}/{{ _aap_portal_plugins.filename }}"
+        mode: "0644"
+        headers:
+          Authorization: Bearer {{ r_rhsm_token.json.access_token }}
+
+    - name: Create plugin dest
+      tags: rhsm
+      ansible.builtin.file:
+        path: "{{ plugins_download_dest }}"
+        state: directory
+
+    - name: Extract plugins
+      tags: rhsm
+      ansible.builtin.unarchive:
+        src: "{{ playbook_dir }}/{{ _aap_portal_plugins.filename }}"  
+        dest: "{{ plugins_download_dest }}"
+        exclude:
+          - "*code*"
+
+    - name: Create OpenShift Project
+      tags: ocp
+      redhat.openshift.k8s:
+        state: present
+        resource_definition:
+          apiVersion: project.openshift.io/v1
+          kind: Project
+          metadata:
+            name: "{{ ocp_project_name }}"
+
+    - name: Create BuildConfig
+      tags: ocp
+      redhat.openshift.k8s:
+        state: present
+        resource_definition:
+          kind: BuildConfig
+          apiVersion: build.openshift.io/v1
+          metadata:
+            name: "{{ ocp_build_config_name }}"
+            namespace: "{{ ocp_project_name }}"
+            labels:
+              build: "{{ ocp_build_config_name }}"
+          spec:
+            output:
+              to:
+                kind: ImageStreamTag
+                name: "{{ ocp_build_config_name }}:latest"
+            strategy:
+              type: Source
+              sourceStrategy:
+                from:
+                  kind: ImageStreamTag
+                  namespace: openshift
+                  name: 'httpd:2.4-ubi8'
+            source:
+              type: Binary
+              binary: {}
+
+    - name: Create ImageStream
+      tags: ocp
+      redhat.openshift.k8s:
+        state: present
+        resource_definition:
+          kind: ImageStream
+          apiVersion: image.openshift.io/v1
+          metadata:
+            name: "{{ ocp_build_config_name }}"
+            namespace: "{{ ocp_project_name }}"
+            labels:
+              build: "{{ ocp_build_config_name }}"
+          spec:
+            lookupPolicy:
+              local: false
+
+    - name: Starts build from build config
+      tags: ocp
+      ansible.builtin.command:
+        cmd: oc start-build {{ ocp_build_config_name }} --from-dir={{ plugins_download_dest }} --wait
+
+    - name: Create Deployment
+      tags: ocp
+      redhat.openshift.k8s:
+        state: present
+        resource_definition:
+          kind: Deployment
+          apiVersion: apps/v1
+          metadata:
+            name: "{{ ocp_build_config_name }}"
+            namespace: "{{ ocp_project_name }}" 
+            labels:
+              app: "{{ ocp_build_config_name }}"
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                deployment: "{{ ocp_build_config_name }}"
+            template:
+              metadata:
+                labels:
+                  deployment: "{{ ocp_build_config_name }}"
+              spec:
+                containers:
+                  - name: "{{ ocp_build_config_name }}"
+                    image: "image-registry.openshift-image-registry.svc:5000/{{ ocp_project_name }}/{{ ocp_build_config_name }}"
+                    ports:
+                      - containerPort: 8080
+                        protocol: TCP
+                      - containerPort: 8443
+                        protocol: TCP
