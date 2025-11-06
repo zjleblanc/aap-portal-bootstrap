@@ -1,5 +1,5 @@
 ---
-- name: AAP Portal Bootstrap
+- name: aap Portal Bootstrap
   hosts: localhost
   gather_facts: false
   become: false
@@ -8,13 +8,16 @@
     # --- Important Environment Variables ---
     # AAP_HOSTNAME: "https://your-aap-url.example.com"
     # AAP_USERNAME: "aap_admin_user"
-    # AAP_PASSWORD: "YOUR_AAP_ADMIN_PASSWORD"
+    # AAP_PASSWORD: "your_aap_admin_password"
 
     # --- Configuration Variables ---
     aap_org_name: "Default"
     aap_app_name: "Automation Self-Service Portal"
     ocp_project_name: aap-portal
+
+    # --- Static Variables - DO NOT CHANGE ---
     ocp_build_config_name: plugin-registry
+    ocp_portal_secret_name: secrets-rhaap-portal
 
     # --- Artifacts ---
     aap_version: 2.6
@@ -24,13 +27,13 @@
     plugins_download_dest: "{{ playbook_dir }}/self-service-automation-portal-plugins"
 
   tasks:
-    - name: Create Organization
+    - name: aap | create organization
       tags: aap
       ansible.platform.organization:
         name: "{{ aap_org_name }}"
         state: present
 
-    - name: Create OAuth Application
+    - name: aap | create oauth app
       tags: aap
       register: r_oauth_app
       ansible.platform.application:
@@ -41,31 +44,22 @@
         redirect_uris: "https://example.com" # Placeholder URI as per documentation
         state: present
 
-    # - name: Debug OAuth details
-    #   when: r_oauth_app.changed or not r_oauth_app.client_id
-    #   ansible.builtin.debug:
-    #     msg: |
-    #       OAuth Client ID: {{ r_oauth_app.client_id }}
-    #       OAuth Client Secret: {{ r_oauth_app.client_secret }}
-    #       Remember to replace the placeholder Redirect URI
-    #       with the actual deployment URL after installation.
-
-    - name: Allow OAuth2 for External Users
+    - name: aap | allow external user tokens
       tags: aap
       ansible.platform.settings:
         settings:
           ALLOW_OAUTH2_FOR_EXTERNAL_USERS: true
 
-    - name: Create read-only token for Admin
+    - name: aap | create read-only admin token
       tags: aap
       register: r_readonly_token
       ansible.platform.token:
         description: "Self-Service Automation Portal"
-        scope: read # Scope is set to 'Read' as per documentation
+        scope: read
         state: present
 
     # Modified tasks from infra.aap_utilities.aap_setup_download
-    - name: Login to Red Hat APIs
+    - name: rhsm | get red hat api token
       tags: ['rhsm','plugins']
       register: r_rhsm_token
       ansible.builtin.uri:
@@ -77,7 +71,7 @@
           client_id: rhsm-api
           refresh_token: "{{ rhsm_offline_token }}"
 
-    - name: Collecting the available installers
+    - name: rhsm | collect available installers
       tags: ['rhsm','plugins']
       register: r_aap_installers
       ansible.builtin.uri:
@@ -87,12 +81,12 @@
         headers:
           Authorization: Bearer {{ r_rhsm_token.json.access_token }}
 
-    - name: Extract download path for Self-Service Portal plugins
+    - name: rhsm | extract download path for plugins
       tags: ['rhsm','plugins']
       ansible.builtin.set_fact:
         _aap_portal_plugins: "{{ r_aap_installers.json.body | selectattr('filename','match','self-service') | first }}"
 
-    - name: Downloading the plugins
+    - name: rhsm | download plugins
       tags: ['rhsm','plugins']
       ansible.builtin.get_url:
         url: "{{ _aap_portal_plugins.downloadHref }}"
@@ -101,13 +95,13 @@
         headers:
           Authorization: Bearer {{ r_rhsm_token.json.access_token }}
 
-    - name: Create plugin dest
+    - name: plugin-registry | create dest
       tags: ['rhsm','plugins']
       ansible.builtin.file:
         path: "{{ plugins_download_dest }}"
         state: directory
 
-    - name: Extract plugins
+    - name: plugin-registry | extract plugins
       tags: ['rhsm','plugins']
       ansible.builtin.unarchive:
         src: "{{ playbook_dir }}/{{ _aap_portal_plugins.filename }}"  
@@ -115,7 +109,7 @@
         exclude:
           - "*code*"
 
-    - name: Create OpenShift Project
+    - name: ocp | create project
       tags: ocp
       redhat.openshift.k8s:
         state: present
@@ -125,7 +119,7 @@
           metadata:
             name: "{{ ocp_project_name }}"
 
-    - name: Create BuildConfig
+    - name: plugin-registry | create build config
       tags: ['ocp','plugins']
       register: r_plugin_bc
       redhat.openshift.k8s:
@@ -154,7 +148,7 @@
               type: Binary
               binary: {}
 
-    - name: Create ImageStream
+    - name: plugin-registry | create image stream 
       tags: ['ocp','plugins']
       redhat.openshift.k8s:
         state: present
@@ -170,13 +164,13 @@
             lookupPolicy:
               local: false
 
-    - name: Starts build from build config
+    - name: plugin-registry | start build
       tags: ['ocp','plugins']
       when: r_plugin_bc is changed
       ansible.builtin.command:
         cmd: oc start-build -n {{ ocp_project_name }} {{ ocp_build_config_name }} --from-dir={{ plugins_download_dest }} --wait
 
-    - name: Create Deployment
+    - name: plugin-registry | create deployment
       tags: ['ocp','plugins']
       redhat.openshift.k8s:
         state: present
@@ -207,7 +201,7 @@
                       - containerPort: 8443
                         protocol: TCP
 
-    - name: Create a Service object from an inline definition
+    - name: plugin-registry | create service
       tags: ['ocp','plugins']
       redhat.openshift.k8s:
         state: present
@@ -224,7 +218,7 @@
               app.kubernetes.io/name: "{{ ocp_build_config_name }}"
           spec:
             selector:
-              deployment: plugin-registry
+              deployment: "{{ ocp_build_config_name }}"
             ports:
               - name: 8080-tcp
                 protocol: TCP
@@ -235,7 +229,7 @@
                 port: 8443
                 targetPort: 8443
 
-    - name: Create Self-Service Portal secret
+    - name: portal | create secret
       tags: ['ocp','portal','secret']
       register: r_portal_secret
       when:
@@ -247,7 +241,7 @@
           apiVersion: v1
           kind: Secret
           metadata:
-            name: secrets-rhaap-portal
+            name: "{{ ocp_portal_secret_name }}"
             namespace: "{{ ocp_project_name }}"
           type: Opaque
           data:
@@ -256,9 +250,8 @@
             oauth-client-secret: "{{ r_oauth_app.client_secret | b64encode }}"
             aap-token: "{{ r_readonly_token.ansible_facts.aap_token.token | b64encode }}"
 
-    - name: Install Self-Service Portal via Helm
+    - name: portal | helm install
       tags: ['ocp','portal','helm']
-      # when: r_portal_secret is success
       kubernetes.core.helm:
         name: redhat-rhaap-portal
         chart_ref: openshift-helm-charts/redhat-rhaap-portal
@@ -273,17 +266,17 @@
           #     rhaap:
           #       orgs: [Default]
 
-    - name: Wait for Deployment
+    - name: portal | wait for deployment 
       tags: ['ocp','portal']
       kubernetes.core.k8s_info:
         kind: Deployment
         name: redhat-rhaap-portal
         namespace: "{{ ocp_project_name }}"
         wait: true
-        wait_timeout: 300 # 5 minutes
+        wait_timeout: 300 # 5m
         wait_sleep: 10
 
-    - name: Get Self-Service Portal Route
+    - name: portal | get route
       tags: ['ocp','portal']
       register: r_portal_route
       kubernetes.core.k8s_info:
@@ -296,7 +289,7 @@
           - metadata
           - status
 
-    - name: Update OAuth Application
+    - name: aap | update oauth app
       tags: ['aap','portal']
       ansible.platform.application:
         name: "{{ aap_app_name }}"
