@@ -33,6 +33,13 @@
         name: "{{ aap_org_name }}"
         state: present
 
+    - name: aap | delete existing oauth app
+      tags: aap
+      ansible.platform.application:
+        name: "{{ aap_app_name }}"
+        organization: "{{ aap_org_name }}"
+        state: absent
+
     - name: aap | create oauth app
       tags: aap
       register: r_oauth_app
@@ -234,6 +241,7 @@
       register: r_portal_secret
       when:
         - r_oauth_app is defined
+        - r_oauth_app is changed
         - r_readonly_token is defined
       redhat.openshift.k8s:
         state: present
