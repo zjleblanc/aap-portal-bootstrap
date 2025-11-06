@@ -259,7 +259,7 @@
         values:
           "redhat-developer-hub":
             global:
-              # convert https://api.example.com:6443 -> https://apps.example.com
+              # convert https://api.example.com:6443 -> apps.example.com
               clusterRouterBase: "{{ (lookup('ansible.builtin.env', 'K8S_AUTH_HOST') | replace('api','apps'))[8:-5] }}"
           # catalog:
           #   providers:
