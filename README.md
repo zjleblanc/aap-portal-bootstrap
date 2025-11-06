@@ -2,6 +2,13 @@
 
 Ansible playbook to install the Ansible Automation Platform Self-Service Portal on Openshift. Based on the Red Hat Ansible Automation Platform [documentation](https://docs.redhat.com/en/documentation/red_hat_ansible_automation_platform/2.6/html-single/installing_self-service_automation_portal/index).
 
+## Usage
+
+Once you have satisfied the requirements outlined below, the playbook can be executed as:
+```bash
+ansible-playbook bootstrap.yml -e rhsm_offline_token=<token>
+```
+
 ## Pre-requisites
 
 - RHSM API Offline Token -> [Instructions](https://access.redhat.com/articles/3626371)
