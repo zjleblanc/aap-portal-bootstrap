@@ -64,15 +64,9 @@
         scope: read # Scope is set to 'Read' as per documentation
         state: present
 
-    - name: Debug admin token
-      tags: aap
-      when: r_readonly_token.changed
-      ansible.builtin.debug:
-        msg: "Generated Admin Token: {{ r_readonly_token.ansible_facts.aap_token.token }}"
-
     # Modified tasks from infra.aap_utilities.aap_setup_download
     - name: Login to Red Hat APIs
-      tags: rhsm
+      tags: ['rhsm','plugins']
       register: r_rhsm_token
       ansible.builtin.uri:
         url: https://sso.redhat.com/auth/realms/redhat-external/protocol/openid-connect/token
@@ -84,7 +78,7 @@
           refresh_token: "{{ rhsm_offline_token }}"
 
     - name: Collecting the available installers
-      tags: rhsm
+      tags: ['rhsm','plugins']
       register: r_aap_installers
       ansible.builtin.uri:
         url: "https://api.access.redhat.com/management/v1/images/cset/{{ aap_release_url }}"
@@ -94,12 +88,12 @@
           Authorization: Bearer {{ r_rhsm_token.json.access_token }}
 
     - name: Extract download path for Self-Service Portal plugins
-      tags: rhsm
+      tags: ['rhsm','plugins']
       ansible.builtin.set_fact:
         _aap_portal_plugins: "{{ r_aap_installers.json.body | selectattr('filename','match','self-service') | first }}"
 
     - name: Downloading the plugins
-      tags: rhsm
+      tags: ['rhsm','plugins']
       ansible.builtin.get_url:
         url: "{{ _aap_portal_plugins.downloadHref }}"
         dest: "{{ playbook_dir }}/{{ _aap_portal_plugins.filename }}"
@@ -108,13 +102,13 @@
           Authorization: Bearer {{ r_rhsm_token.json.access_token }}
 
     - name: Create plugin dest
-      tags: rhsm
+      tags: ['rhsm','plugins']
       ansible.builtin.file:
         path: "{{ plugins_download_dest }}"
         state: directory
 
     - name: Extract plugins
-      tags: rhsm
+      tags: ['rhsm','plugins']
       ansible.builtin.unarchive:
         src: "{{ playbook_dir }}/{{ _aap_portal_plugins.filename }}"  
         dest: "{{ plugins_download_dest }}"
@@ -132,7 +126,8 @@
             name: "{{ ocp_project_name }}"
 
     - name: Create BuildConfig
-      tags: ocp
+      tags: ['ocp','plugins']
+      register: r_plugin_bc
       redhat.openshift.k8s:
         state: present
         resource_definition:
@@ -160,7 +155,7 @@
               binary: {}
 
     - name: Create ImageStream
-      tags: ocp
+      tags: ['ocp','plugins']
       redhat.openshift.k8s:
         state: present
         resource_definition:
@@ -176,12 +171,13 @@
               local: false
 
     - name: Starts build from build config
-      tags: ocp
+      tags: ['ocp','plugins']
+      when: r_plugin_bc is changed
       ansible.builtin.command:
-        cmd: oc start-build {{ ocp_build_config_name }} --from-dir={{ plugins_download_dest }} --wait
+        cmd: oc start-build -n {{ ocp_project_name }} {{ ocp_build_config_name }} --from-dir={{ plugins_download_dest }} --wait
 
     - name: Create Deployment
-      tags: ocp
+      tags: ['ocp','plugins']
       redhat.openshift.k8s:
         state: present
         resource_definition:
@@ -210,3 +206,100 @@
                         protocol: TCP
                       - containerPort: 8443
                         protocol: TCP
+
+    - name: Create a Service object from an inline definition
+      tags: ['ocp','plugins']
+      redhat.openshift.k8s:
+        state: present
+        resource_definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: "{{ ocp_build_config_name }}"
+            namespace: "{{ ocp_project_name }}"
+            labels:
+              app: "{{ ocp_build_config_name }}"
+              app.kubernetes.io/component: "{{ ocp_build_config_name }}"
+              app.kubernetes.io/instance: "{{ ocp_build_config_name }}"
+              app.kubernetes.io/name: "{{ ocp_build_config_name }}"
+          spec:
+            selector:
+              deployment: plugin-registry
+            ports:
+              - name: 8080-tcp
+                protocol: TCP
+                port: 8080
+                targetPort: 8080
+              - name: 8443-tcp
+                protocol: TCP
+                port: 8443
+                targetPort: 8443
+
+    - name: Create Self-Service Portal secret
+      tags: ['ocp','portal','secret']
+      register: r_portal_secret
+      when:
+        - r_oauth_app is defined
+        - r_readonly_token is defined
+      redhat.openshift.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: secrets-rhaap-portal
+            namespace: "{{ ocp_project_name }}"
+          type: Opaque
+          data:
+            aap-host-url: "{{ lookup('ansible.builtin.env','AAP_HOSTNAME') | b64encode }}"
+            oauth-client-id: "{{ r_oauth_app.client_id | b64encode }}"
+            oauth-client-secret: "{{ r_oauth_app.client_secret | b64encode }}"
+            aap-token: "{{ r_readonly_token.ansible_facts.aap_token.token | b64encode }}"
+
+    - name: Install Self-Service Portal via Helm
+      tags: ['ocp','portal','helm']
+      # when: r_portal_secret is success
+      kubernetes.core.helm:
+        name: redhat-rhaap-portal
+        chart_ref: openshift-helm-charts/redhat-rhaap-portal
+        release_namespace: "{{ ocp_project_name }}"
+        values:
+          "redhat-developer-hub":
+            global:
+              # convert https://api.example.com:6443 -> https://apps.example.com
+              clusterRouterBase: "{{ (lookup('ansible.builtin.env', 'K8S_AUTH_HOST') | replace('api','apps'))[8:-5] }}"
+          # catalog:
+          #   providers:
+          #     rhaap:
+          #       orgs: [Default]
+
+    - name: Wait for Deployment
+      tags: ['ocp','portal']
+      kubernetes.core.k8s_info:
+        kind: Deployment
+        name: redhat-rhaap-portal
+        namespace: "{{ ocp_project_name }}"
+        wait: true
+        wait_timeout: 300 # 5 minutes
+        wait_sleep: 10
+
+    - name: Get Self-Service Portal Route
+      tags: ['ocp','portal']
+      register: r_portal_route
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Route
+        name: redhat-rhaap-portal
+        namespace: "{{ ocp_project_name }}"
+        wait: true
+        hidden_fields:
+          - metadata
+          - status
+
+    - name: Update OAuth Application
+      tags: ['aap','portal']
+      ansible.platform.application:
+        name: "{{ aap_app_name }}"
+        organization: "{{ aap_org_name }}"
+        redirect_uris: "https://{{ (r_portal_route.resources | first).spec.host }}/api/auth/rhaap/handler/frame"
+        state: present
