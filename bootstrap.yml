@@ -1,5 +1,5 @@
 ---
-- name: aap Portal Bootstrap
+- name: Ansible Automation Platform Self-Service Portal Bootstrap
   hosts: localhost
   gather_facts: false
   become: false
