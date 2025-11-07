@@ -21,7 +21,7 @@ ansible-playbook bootstrap.yml -e rhsm_offline_token=<token>
   | K8S_AUTH_HOST | https://api.ocp.example.com:6443 |
 - Login to OpenShift<br>
   `oc login --token={token} --server=https://api.ocp.example.com:6443`<br>
-- _You can use other supported methods to leverage the collections below (I have outlined what I used)_
+- _You can use other supported authentication methods to leverage the collections below (I have outlined what I used)_
 
 ## Requirements
 
